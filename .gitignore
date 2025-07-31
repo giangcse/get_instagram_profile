@@ -1,0 +1,4 @@
+.env
+credentials.json
+instagram_cookies.pkl
+.venv/
