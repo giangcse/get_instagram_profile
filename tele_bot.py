@@ -253,20 +253,77 @@ async def scrape_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         context.job_queue.run_once(scraping_background_task, 0, chat_id=chat_id, name=f"scrape_{chat_id}")
     else:
         await update.message.reply_text("Lỗi: JobQueue không khả dụng.")
+
+# --- Luồng hội thoại cho lệnh /add (ĐÃ NÂNG CẤP) ---
+
+async def write_profile_to_sheet(profile_data: dict):
+    """Hàm tiện ích để ghi một hồ sơ hoàn chỉnh vào Google Sheet."""
+    try:
+        headers = worksheet.row_values(1)
+        # Tạo một hàng rỗng với đúng số lượng cột
+        new_row = [''] * len(headers)
+        
+        # Điền dữ liệu vào đúng vị trí cột
+        url_col_index = headers.index("URL")
+        rating_col_index = headers.index(RATING_COLUMN_NAME)
+        notes_col_index = headers.index(NOTES_COLUMN_NAME)
+        
+        new_row[url_col_index] = profile_data.get('url', '')
+        new_row[rating_col_index] = profile_data.get('rating', '')
+        new_row[notes_col_index] = profile_data.get('note', '')
+        
+        worksheet.append_row(new_row)
+        logger.info(f"Đã ghi hồ sơ {profile_data.get('username')} vào sheet.")
+        return True
+    except Exception as e:
+        logger.error(f"Lỗi khi ghi vào sheet: {e}")
+        return False
+
+async def process_next_in_queue(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Xử lý hồ sơ tiếp theo trong hàng đợi."""
+    profiles_to_process = context.user_data.get('profiles_to_process', [])
+    
+    if not profiles_to_process:
+        await update.effective_message.reply_text("✅ Hoàn tất! Đã xử lý tất cả hồ sơ mới.")
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    next_profile = profiles_to_process.pop(0)
+    context.user_data['current_profile'] = next_profile
+    
+    username = next_profile['username']
+    
+    keyboard = [[InlineKeyboardButton(f"⭐️ {i}", callback_data=str(i)) for i in range(1, 6)]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    message_text = f"⏳ Đang xử lý: <b>{username}</b>\nVui lòng chọn xếp hạng:"
+    
+    if update.callback_query:
+        await update.callback_query.edit_message_text(message_text, reply_markup=reply_markup, parse_mode=ParseMode.HTML)
+    else:
+        await update.effective_message.reply_text(message_text, reply_markup=reply_markup, parse_mode=ParseMode.HTML)
+        
+    return ASKING_RATING
+
 @restricted
 async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Bắt đầu quá trình thêm và đánh giá tuần tự nhiều hồ sơ."""
     if worksheet is None:
         await update.message.reply_text("Lỗi: Bot không thể kết nối tới Google Sheet.")
         return ConversationHandler.END
     if not context.args:
         await update.message.reply_text("Sử dụng: /add <code>&lt;url1&gt; [url2]...</code>", parse_mode=ParseMode.HTML)
         return ConversationHandler.END
+
     urls_to_add = context.args
-    added_profiles_queue = []
+    # SỬA LỖI: Đổi tên biến từ 'added_profiles_queue' thành 'profiles_to_process_queue'
+    profiles_to_process_queue = []
     skipped_count = 0
+    
     try:
         existing_urls = worksheet.col_values(2)[1:]
         existing_usernames = {extract_username(url).lower() for url in existing_urls if extract_username(url)}
+        
         for raw_url in urls_to_add:
             new_username = extract_username(raw_url)
             if not new_username:
@@ -275,35 +332,47 @@ async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
             if new_username.lower() in existing_usernames:
                 skipped_count += 1
                 continue
+            
             canonical_url = f"https://www.instagram.com/{new_username}/"
             profiles_to_process_queue.append({'username': new_username, 'url': canonical_url})
+
         if not profiles_to_process_queue:
             await update.message.reply_text(f"Không có hồ sơ nào được thêm. Đã bỏ qua {skipped_count} hồ sơ bị trùng.")
             return ConversationHandler.END
+
         context.user_data['profiles_to_process'] = profiles_to_process_queue
+        
         summary_text = f"Đã tìm thấy {len(profiles_to_process_queue)} hồ sơ mới để thêm."
         if skipped_count > 0:
             summary_text += f" Bỏ qua {skipped_count} hồ sơ bị trùng."
         await update.message.reply_text(summary_text)
+        
         return await process_next_in_queue(update, context)
+
     except Exception as e:
         logger.error(f"Lỗi khi thực hiện /add: {e}")
         await update.message.reply_text("Đã có lỗi xảy ra trong quá trình xử lý.")
         return ConversationHandler.END
+
 async def rating_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
     rating_value = query.data
     current_profile = context.user_data.get('current_profile')
+    
     if not current_profile:
         await query.edit_message_text("Lỗi: Không tìm thấy thông tin hồ sơ hiện tại. Vui lòng thử lại.")
         return ConversationHandler.END
+
     current_profile['rating'] = rating_value
+    
     await query.edit_message_text(text=f"👍 Đã lưu xếp hạng: {rating_value} sao cho <b>{current_profile['username']}</b>!", parse_mode=ParseMode.HTML)
+    
     keyboard = [[InlineKeyboardButton("Thêm ghi chú", callback_data="add_note"), InlineKeyboardButton("Bỏ qua", callback_data="skip_note")]]
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.effective_message.reply_text("Bạn có muốn thêm ghi chú không?", reply_markup=reply_markup)
     return ASKING_NOTE_CHOICE
+
 async def note_choice_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
@@ -316,16 +385,23 @@ async def note_choice_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.edit_message_text("Đã bỏ qua ghi chú. Đang lưu vào sheet...")
         await write_profile_to_sheet(current_profile)
         return await process_next_in_queue(update, context)
+
 async def receive_note_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     note_text = update.message.text
     current_profile = context.user_data.get('current_profile')
+    
     if not current_profile:
         await update.message.reply_text("Lỗi: Không tìm thấy thông tin hồ sơ hiện tại. Vui lòng thử lại.")
         return ConversationHandler.END
+        
     current_profile['note'] = note_text
     await update.message.reply_text("✅ Đã lưu ghi chú. Đang lưu vào sheet...")
+    
     await write_profile_to_sheet(current_profile)
+    
     return await process_next_in_queue(update, context)
+
+# --- Các luồng hội thoại khác (không đổi) ---
 @restricted
 async def delete_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not context.args:
@@ -445,13 +521,13 @@ async def search_page_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
 def main() -> None:
     """Khởi chạy và vận hành bot."""
-    # SỬA LỖI: Tăng thời gian chờ mặc định để chống lỗi TimedOut bằng phương pháp mới
+    job_queue = JobQueue()
     application = (
         Application.builder()
         .token(TELEGRAM_TOKEN)
-        .job_queue(JobQueue())
-        .connect_timeout(15) # Tăng connect timeout lên 15 giây
-        .read_timeout(15)    # Tăng read timeout lên 15 giây
+        .job_queue(job_queue)
+        .connect_timeout(15)
+        .read_timeout(15)
         .build()
     )
 
