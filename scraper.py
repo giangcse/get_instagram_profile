@@ -1,8 +1,7 @@
 # File: scraper.py
-# Module này chứa logic để cào dữ liệu từ Instagram bằng thư viện Instaloader
+# Module này chứa logic để cào dữ liệu từ Instagram bằng Playwright
 # và tải ảnh đại diện lên Cloudinary để có URL vĩnh viễn.
 
-import instaloader
 import logging
 import time
 import random
@@ -12,29 +11,21 @@ import requests
 import cloudinary
 import cloudinary.uploader
 from dotenv import load_dotenv
+from playwright.async_api import async_playwright
+from bs4 import BeautifulSoup
 
 # Tải các biến môi trường ngay khi module này được import
 load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-# --- CẤU HÌNH CLOUDINARY TỪ BIẾN MÔI TRƯỜNG ---
+# --- CẤU HÌNH CLOUDINARY TỪ BIẾN MÔI TRƯỜDNG ---
 cloudinary.config(
   cloud_name = os.getenv("CLOUDINARY_CLOUD_NAME"),
   api_key = os.getenv("CLOUDINARY_API_KEY"),
   api_secret = os.getenv("CLOUDINARY_API_SECRET"),
   secure = True
 )
-
-# Tương thích với nhiều phiên bản Instaloader
-try:
-    from instaloader.exceptions import ProfileNotFoundException
-except ImportError:
-    try:
-        from instaloader.exceptions import ProfileNotExistException as ProfileNotFoundException
-    except ImportError:
-        from instaloader.exceptions import ProfileNotExistsException as ProfileNotFoundException
-
 
 def extract_username(url: str) -> str | None:
     """Trích xuất username từ URL Instagram."""
@@ -63,86 +54,87 @@ def upload_image_to_cloudinary(image_url: str, public_id: str):
         logger.error(f"Lỗi khi tải ảnh lên Cloudinary cho {public_id}: {e}")
         return None
 
-def scrape_instagram_profiles(session_file_path: str, profiles_to_scrape: list):
+async def scrape_instagram_profiles(session_file_path: str, profiles_to_scrape: list):
     """
-    Hàm chính để cào dữ liệu và tải ảnh lên Cloudinary.
+    Hàm chính để cào dữ liệu bằng Playwright và tải ảnh lên Cloudinary.
     """
-    L = instaloader.Instaloader(
-        download_pictures=False,
-        download_videos=False,
-        download_video_thumbnails=False,
-        download_geotags=False,
-        download_comments=False,
-        save_metadata=False,
-        compress_json=False,
-        sleep=True,
-        fatal_status_codes=[400, 401, 403, 429]
-    )
-
-    try:
-        username_for_session = session_file_path.split('/')[-1].split('\\')[-1]
-        logger.info(f"Đang tải session cho user '{username_for_session}' từ file: {session_file_path}")
-        L.load_session_from_file(username_for_session, session_file_path)
-        logger.info("✅ Tải session thành công.")
-    except FileNotFoundError:
+    if not os.path.exists(session_file_path):
         logger.error(f"Không tìm thấy file session tại '{session_file_path}'. Hãy tạo và tải nó lên.")
-        return None
-    except Exception as e:
-        logger.error(f"Lỗi khi tải session: {e}")
         return None
 
     results = []
-    for profile_info in profiles_to_scrape:
-        url = profile_info.get('url')
-        username_to_scrape = extract_username(url)
+    async with async_playwright() as p:
+        # Chạy trình duyệt ở chế độ headless (không có giao diện) trên server
+        browser = await p.firefox.launch()
+        context = await browser.new_context(storage_state=session_file_path)
 
-        if not username_to_scrape:
-            logger.warning(f"Bỏ qua URL không hợp lệ: {url}")
-            continue
+        for profile_info in profiles_to_scrape:
+            url = profile_info.get('url')
+            username_to_scrape = extract_username(url)
 
-        try:
-            logger.info(f"Đang cào dữ liệu cho: {username_to_scrape}")
-            profile = instaloader.Profile.from_username(L.context, username_to_scrape)
-            
-            original_pic_url = profile.profile_pic_url
-            
-            logger.info(f"Đang tải ảnh đại diện của {username_to_scrape} lên Cloudinary...")
-            cloudinary_pic_url = upload_image_to_cloudinary(original_pic_url, username_to_scrape)
-            
-            results.append({
-                'row_index': profile_info['row_index'],
-                'full_name': profile.full_name or profile.username,
-                'profile_pic_url': cloudinary_pic_url or original_pic_url,
-            })
-            
-            sleep_time = random.uniform(5.0, 10.0)
-            logger.debug(f"Nghỉ {sleep_time:.2f} giây...")
-            time.sleep(sleep_time)
+            if not username_to_scrape:
+                logger.warning(f"Bỏ qua URL không hợp lệ: {url}")
+                continue
 
-        # SỬA LỖI: Xử lý lỗi session hết hạn hoặc không hợp lệ
-        except instaloader.exceptions.LoginRequiredException:
-            logger.error("LỖI NGHIÊM TRỌNG: Session không hợp lệ hoặc đã hết hạn. Instagram yêu cầu đăng nhập lại.")
-            # Dừng toàn bộ quá trình và trả về None để bot biết và thông báo cho người dùng
-            return None
-            
-        except instaloader.exceptions.TooManyRequestsException:
-            logger.error(f"Bị giới hạn tốc độ (rate-limited) khi cào dữ liệu cho {username_to_scrape}. Bỏ qua profile này.")
-            results.append({
-                'row_index': profile_info['row_index'],
-                'full_name': "Rate Limited",
-                'profile_pic_url': "",
-            })
-            continue
+            page = await context.new_page()
+            try:
+                logger.info(f"Đang cào dữ liệu cho: {username_to_scrape}")
+                await page.goto(f"https://www.instagram.com/{username_to_scrape}/", timeout=60000)
+                
+                # Chờ cho đến khi phần header của trang được tải
+                await page.wait_for_selector('header', timeout=20000)
 
-        except ProfileNotFoundException:
-            logger.warning(f"Profile không tồn tại: {username_to_scrape}")
-            results.append({
-                'row_index': profile_info['row_index'],
-                'full_name': "Not Found",
-                'profile_pic_url': "",
-            })
-        except Exception as e:
-            logger.error(f"Lỗi không xác định khi cào dữ liệu cho {username_to_scrape}: {e}")
-            continue
+                # Lấy ảnh đại diện
+                img_selector = 'header img'
+                await page.wait_for_selector(img_selector, timeout=10000)
+                original_pic_url = await page.locator(img_selector).get_attribute('src')
+
+                # SỬA LỖI: Logic lấy tên đầy đủ được cải tiến để ổn định hơn
+                full_name = username_to_scrape # Mặc định là username
+                try:
+                    # Selector này tìm tất cả các thẻ span có thuộc tính dir="auto" trong header
+                    full_name_selector = 'header span[dir="auto"]'
+                    await page.wait_for_selector(full_name_selector, timeout=10000)
+                    
+                    all_spans = await page.locator(full_name_selector).all()
+                    
+                    # Duyệt qua các thẻ span tìm được để lọc ra tên thật
+                    for span_element in all_spans:
+                        text = (await span_element.text_content() or "").strip()
+                        
+                        # Tên thật thường không phải là các nút hành động, số, hoặc các chuỗi ngắn
+                        if text and len(text) > 1 and not text.isnumeric() and text.lower() not in ["follow", "message", "following", "followers", "posts"]:
+                            full_name = text
+                            break # Dừng lại ngay khi tìm thấy tên hợp lệ đầu tiên
+                            
+                except Exception as name_error:
+                    logger.warning(f"Không tìm thấy tên đầy đủ cho {username_to_scrape}, sử dụng username thay thế. Lỗi: {name_error}")
+                    full_name = username_to_scrape
+
+                logger.info(f"Đang tải ảnh đại diện của {username_to_scrape} lên Cloudinary...")
+                cloudinary_pic_url = upload_image_to_cloudinary(original_pic_url, username_to_scrape)
+                
+                results.append({
+                    'row_index': profile_info['row_index'],
+                    'full_name': full_name.strip() or username_to_scrape,
+                    'profile_pic_url': cloudinary_pic_url or original_pic_url,
+                })
+                
+                sleep_time = random.uniform(3.0, 6.0)
+                logger.debug(f"Nghỉ {sleep_time:.2f} giây...")
+                await page.wait_for_timeout(sleep_time * 1000)
+
+            except Exception as e:
+                logger.error(f"Lỗi không xác định khi cào dữ liệu cho {username_to_scrape}: {e}")
+                page_content = await page.content()
+                if "Sorry, this page isn't available" in page_content:
+                     results.append({'row_index': profile_info['row_index'], 'full_name': "Not Found", 'profile_pic_url': ""})
+                else:
+                    results.append({'row_index': profile_info['row_index'], 'full_name': "Scrape Error", 'profile_pic_url': ""})
+                
+            finally:
+                await page.close()
+        
+        await browser.close()
             
     return results

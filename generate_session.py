@@ -1,40 +1,49 @@
 # File: generate_session.py
-# Mục đích: Chạy file này MỘT LẦN DUY NHẤT trên máy tính của bạn để tạo file session.
+# Mục đích: Chạy file này MỘT LẦN DUY NHẤT trên máy tính của bạn để tạo file playwright_session.json
 # Sau đó, tải file session này lên cùng thư mục với bot trên server hosting.
 
-import instaloader
-import getpass
+from playwright.sync_api import sync_playwright
+import time
 import os
 
-try:
-    # Tạo một instance của Instaloader
-    L = instaloader.Instaloader(
-        download_pictures=False,
-        download_videos=False,
-        download_video_thumbnails=False,
-        download_geotags=False,
-        download_comments=False,
-        save_metadata=False,
-        compress_json=False
-    )
+SESSION_FILE = "playwright_session.json"
 
-    # Lấy username và password từ người dùng
-    USER = input("Enter your Instagram username: ")
-    PASSWORD = getpass.getpass("Enter your Instagram password (sẽ không hiển thị khi gõ): ")
+def run():
+    with sync_playwright() as p:
+        # Sử dụng trình duyệt Firefox để trông giống người dùng thật hơn
+        browser = p.firefox.launch(headless=False) 
+        context = browser.new_context()
+        page = context.new_page()
 
-    print(f"Logging in as {USER}...")
-    L.login(USER, PASSWORD)
-    print("✅ Đăng nhập thành công!")
+        print("🚀 Trình duyệt đã được mở.")
+        print("Vui lòng đăng nhập vào tài khoản Instagram của bạn.")
+        
+        page.goto("https://www.instagram.com/accounts/login/")
 
-    # Lưu session vào file. Tên file sẽ là username của bạn.
-    # Ví dụ: nếu username là 'mybot', nó sẽ lưu một file tên là 'mybot'.
-    session_filename = os.path.join(os.getcwd(), USER)
-    L.save_session_to_file(session_filename)
-    
-    print(f"✅ Session đã được lưu vào file: {session_filename}")
-    print("Bây giờ bạn có thể tải file này lên server hosting của mình.")
-    print("Lưu ý: Tên file chính là username của bạn.")
+        # Chờ người dùng đăng nhập thủ công
+        # Script sẽ chờ cho đến khi bạn đăng nhập thành công và URL chuyển về trang chủ
+        try:
+            page.wait_for_url("https://www.instagram.com/", timeout=300000) # Chờ tối đa 5 phút
+            print("✅ Đăng nhập thành công!")
+            
+            # Lưu lại trạng thái đăng nhập (cookies, local storage) vào file
+            context.storage_state(path=SESSION_FILE)
+            print(f"✅ Session đã được lưu vào file: {SESSION_FILE}")
+            print("Bây giờ bạn có thể tải file này lên server hosting của mình.")
 
-except Exception as e:
-    print(f"Đã có lỗi xảy ra: {e}")
+        except Exception as e:
+            print(f"Đã có lỗi hoặc hết thời gian chờ. Lỗi: {e}")
+        
+        finally:
+            browser.close()
 
+if __name__ == "__main__":
+    # Kiểm tra xem file session đã tồn tại chưa
+    if os.path.exists(SESSION_FILE):
+        overwrite = input(f"File '{SESSION_FILE}' đã tồn tại. Bạn có muốn ghi đè không? (y/n): ").lower()
+        if overwrite == 'y':
+            run()
+        else:
+            print("Đã hủy thao tác.")
+    else:
+        run()

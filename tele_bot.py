@@ -44,7 +44,7 @@ except (ValueError, TypeError):
     ALLOWED_USER_IDS = set()
 
 # Cấu hình cho scraper
-INSTAGRAM_SESSION_FILE = os.getenv("INSTAGRAM_SESSION_FILE") # Sửa lỗi: Đổi tên biến để rõ ràng hơn
+INSTAGRAM_SESSION_FILE = os.getenv("INSTAGRAM_SESSION_FILE")
 FULL_NAME_COLUMN_NAME = os.getenv("FULL_NAME_COLUMN_NAME", "full_name")
 PROFILE_PIC_URL_COLUMN_NAME = os.getenv("PROFILE_PIC_URL_COLUMN_NAME", "profile_pic_url")
 
@@ -139,25 +139,28 @@ async def scraping_background_task(context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(chat_id, text="✅ Không có hồ sơ mới nào cần cào dữ liệu.")
             return
 
-        # SỬA LỖI: Chạy hàm scraper đồng bộ trong một thread riêng để không block bot
-        scraped_data = await asyncio.to_thread(
-            scraper.scrape_instagram_profiles, INSTAGRAM_SESSION_FILE, profiles_to_scrape
-        )
+        # SỬA LỖI: Gọi trực tiếp hàm scraper bất đồng bộ bằng 'await'
+        scraped_data = await scraper.scrape_instagram_profiles(INSTAGRAM_SESSION_FILE, profiles_to_scrape)
         
         if scraped_data is None:
              await context.bot.send_message(chat_id, text="❌ Lỗi: Không thể cào dữ liệu. Vui lòng kiểm tra file session và log.")
              return
 
-        cells_to_update = []
-        for data in scraped_data:
-            row = data['row_index']
-            cells_to_update.append(gspread.Cell(row, full_name_col, data['full_name']))
-            cells_to_update.append(gspread.Cell(row, pic_url_col, data['profile_pic_url']))
-            
-        if cells_to_update:
-            worksheet.update_cells(cells_to_update)
-            
-        await context.bot.send_message(chat_id, text=f"✅ Hoàn tất! Đã cào và cập nhật dữ liệu cho {len(scraped_data)} hồ sơ.")
+        # SỬA LỖI: Thêm kiểm tra 'if scraped_data' để tránh lỗi khi không có kết quả
+        if scraped_data:
+            cells_to_update = []
+            for data in scraped_data:
+                row = data['row_index']
+                cells_to_update.append(gspread.Cell(row, full_name_col, data['full_name']))
+                cells_to_update.append(gspread.Cell(row, pic_url_col, data['profile_pic_url']))
+                
+            if cells_to_update:
+                worksheet.update_cells(cells_to_update)
+                
+            await context.bot.send_message(chat_id, text=f"✅ Hoàn tất! Đã cào và cập nhật dữ liệu cho {len(scraped_data)} hồ sơ.")
+        else:
+            await context.bot.send_message(chat_id, text="ℹ️ Không có dữ liệu nào được cào thành công.")
+
 
     except Exception as e:
         logger.error(f"Lỗi trong tác vụ nền scraping: {e}")
@@ -525,10 +528,7 @@ async def search_page_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
 def main() -> None:
     """Khởi chạy và vận hành bot."""
-    # SỬA LỖI: Khởi tạo JobQueue một cách tường minh để đảm bảo nó luôn tồn tại.
     job_queue = JobQueue()
-    
-    # SỬA LỖI: Xây dựng ứng dụng và truyền job_queue vào.
     application = Application.builder().token(TELEGRAM_TOKEN).job_queue(job_queue).build()
 
     # Thêm các hội thoại
