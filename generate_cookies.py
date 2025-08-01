@@ -11,6 +11,7 @@ from webdriver_manager.chrome import ChromeDriverManager
 COOKIE_FILE_PATH = "instagram_cookies.pkl"
 
 print("🚀 Khởi tạo trình duyệt Selenium...")
+# Tự động cài đặt và quản lý ChromeDriver
 service = Service(ChromeDriverManager().install())
 driver = webdriver.Chrome(service=service)
 
