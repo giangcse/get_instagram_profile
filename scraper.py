@@ -18,7 +18,8 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from webdriver_manager.chrome import ChromeDriverManager
+# Bỏ import webdriver_manager vì không còn sử dụng
+# from webdriver_manager.chrome import ChromeDriverManager
 
 # Tải các biến môi trường ngay khi module này được import
 load_dotenv()
@@ -70,13 +71,14 @@ def scrape_instagram_profiles(cookie_file_path: str, profiles_to_scrape: list):
 
     # --- Cấu hình Selenium để chạy ở chế độ headless ---
     options = webdriver.ChromeOptions()
-    options.add_argument("--headless=new") # Chế độ headless mới
+    options.add_argument("--headless=new")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
 
-    # Sử dụng webdriver-manager để tự động quản lý driver
-    service = Service(ChromeDriverManager().install())
+    # Trỏ trực tiếp đến chromedriver đã cài đặt trên hệ thống (dành cho Raspberry Pi)
+    chromedriver_path = "/usr/bin/chromedriver"
+    service = Service(executable_path=chromedriver_path)
     driver = webdriver.Chrome(service=service, options=options)
     
     # Tải cookie để đăng nhập
@@ -111,7 +113,7 @@ def scrape_instagram_profiles(cookie_file_path: str, profiles_to_scrape: list):
                 except Exception as img_error:
                     logger.warning(f"Không thể lấy ảnh cho {username_to_scrape}. Lỗi: {img_error}")
 
-                # 2. SỬA LỖI: Lấy tên đầy đủ từ thẻ <title> của trang - cách này ổn định hơn
+                # 2. Lấy tên đầy đủ từ thẻ <title> của trang - cách này ổn định hơn
                 full_name = username_to_scrape # Giá trị mặc định
                 try:
                     # Chờ cho đến khi tiêu đề chứa username để đảm bảo trang đã tải đúng
