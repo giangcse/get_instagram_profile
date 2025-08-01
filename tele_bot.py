@@ -1,6 +1,10 @@
 import logging
 import re
 import os
+import random
+import csv
+import io
+from functools import wraps
 from dotenv import load_dotenv
 import gspread
 from google.oauth2.service_account import Credentials
@@ -13,35 +17,41 @@ from telegram.ext import (
     ContextTypes,
     ConversationHandler,
     CallbackQueryHandler,
+    MessageHandler,
+    filters,
 )
 
 # Tải các biến môi trường từ file .env
 load_dotenv()
 
 # ======================= CẤU HÌNH =======================
-# Lấy thông tin cấu hình từ biến môi trường đã tải
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME")
 WORKSHEET_NAME = os.getenv("WORKSHEET_NAME")
 GOOGLE_CREDENTIALS_FILE = os.getenv("GOOGLE_CREDENTIALS_FILE")
 RATING_COLUMN_NAME = os.getenv("RATING_COLUMN_NAME", "Rating")
+NOTES_COLUMN_NAME = os.getenv("NOTES_COLUMN_NAME", "Notes")
 
-# Bật logging để dễ dàng theo dõi và sửa lỗi
+# TÍNH NĂNG MỚI: Whitelist - Lấy danh sách ID người dùng được phép
+try:
+    ALLOWED_USER_IDS = {int(user_id.strip()) for user_id in os.getenv("ALLOWED_USER_IDS", "").split(',') if user_id.strip()}
+except (ValueError, TypeError):
+    ALLOWED_USER_IDS = set()
+
+# Bật logging
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# Kiểm tra các biến môi trường quan trọng đã được thiết lập chưa
+# Kiểm tra các biến môi trường
 if not all([TELEGRAM_TOKEN, GOOGLE_SHEET_NAME, WORKSHEET_NAME, GOOGLE_CREDENTIALS_FILE]):
-    logger.critical(
-        "Lỗi: Một hoặc nhiều biến môi trường (TELEGRAM_TOKEN, GOOGLE_SHEET_NAME, WORKSHEET_NAME, GOOGLE_CREDENTIALS_FILE) "
-        "chưa được thiết lập trong file .env. Vui lòng kiểm tra lại."
-    )
+    logger.critical("Lỗi: Một hoặc nhiều biến môi trường chưa được thiết lập trong file .env.")
     exit()
+if not ALLOWED_USER_IDS:
+    logger.warning("Cảnh báo: ALLOWED_USER_IDS chưa được thiết lập. Bot sẽ trả lời tất cả mọi người.")
 
 # ======================= KHỞI TẠO KẾT NỐI GOOGLE SHEET =======================
-# TỐI ƯU: Khởi tạo kết nối một lần duy nhất khi bot khởi động để tăng tốc độ phản hồi.
 worksheet = None
 try:
     logger.info("Đang kết nối tới Google Sheets...")
@@ -53,140 +63,433 @@ try:
     logger.info("✅ Kết nối Google Sheets thành công!")
 except Exception as e:
     logger.critical(f"LỖI NGHIÊM TRỌNG: Không thể kết nối tới Google Sheets khi khởi động. Lỗi: {e}")
-    # Biến worksheet sẽ là None, các lệnh sau sẽ kiểm tra và báo lỗi cho người dùng.
 
-# Định nghĩa các trạng thái cho cuộc hội thoại
-ASKING_RATING = range(1)
+# ======================= ĐỊNH NGHĨA TRẠNG THÁI HỘI THOẠI =======================
+(ASKING_RATING, ASKING_NOTE_CHOICE, RECEIVING_NOTE) = range(3)
+(ASK_CONFIRM_DELETE,) = range(3, 4)
+(ASK_UPDATE_RATING,) = range(4, 5)
+(PAGING_SEARCH_RESULTS,) = range(5, 6)
 
-# ======================= CÁC HÀM CỦA BOT =======================
+# ======================= HÀM TRANG TRÍ (DECORATORS) & TIỆN ÍCH =======================
+def restricted(func):
+    """Decorator để giới hạn quyền truy cập bot cho các user trong whitelist."""
+    @wraps(func)
+    async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+        user_id = update.effective_user.id
+        if ALLOWED_USER_IDS and user_id not in ALLOWED_USER_IDS:
+            logger.warning(f"Truy cập bị từ chối cho user_id: {user_id}")
+            await update.message.reply_text("⛔️ Bạn không có quyền sử dụng bot này.")
+            # Nếu là ConversationHandler, cần trả về trạng thái kết thúc để không làm kẹt hội thoại
+            if isinstance(context.application.handlers.get(0), ConversationHandler):
+                 return ConversationHandler.END
+            return
+        return await func(update, context, *args, **kwargs)
+    return wrapped
+
+def find_row_by_username(username_to_find: str):
+    """Tìm hàng và dữ liệu của một hồ sơ dựa trên username."""
+    if worksheet is None: return None, None
+    all_records = worksheet.get_all_records()
+    for index, record in enumerate(all_records):
+        url = record.get("URL", "")
+        if url:
+            existing_username = extract_username(url)
+            if existing_username and existing_username.lower() == username_to_find.lower():
+                return index + 2, record
+    return None, None
 
 def extract_username(url: str) -> str | None:
-    """Trích xuất username từ URL Instagram bằng regex để xử lý nhiều định dạng URL."""
-    if not url:
-        return None
+    """Trích xuất username từ URL Instagram."""
+    if not url: return None
     match = re.search(r"(?:https?://)?(?:www\.)?instagram\.com/([A-Za-z0-9_](?:(?:[A-Za-z0-9_]|\.(?!\.))*[A-Za-z0-9_]){0,29})", url)
-    if match:
-        return match.group(1)
-    return None
+    return match.group(1) if match else None
 
+# ======================= CÁC HÀM XỬ LÝ LỆNH CHÍNH =======================
+
+@restricted
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Gửi tin nhắn chào mừng khi người dùng gõ /start."""
-    await update.message.reply_text(
-        "Xin chào! Tôi là bot giúp bạn thêm hồ sơ Instagram vào Google Sheet.\n\n"
-        "Gửi lệnh `/add <URL_INSTAGRAM>` để bắt đầu."
+    """Gửi tin nhắn chào mừng với danh sách các lệnh."""
+    help_text = (
+        "Xin chào! Tôi là bot quản lý hồ sơ Instagram của bạn.\n\n"
+        "<b>Các lệnh có sẵn:</b>\n"
+        "/add <code>&lt;url1&gt; [url2]...</code> - Thêm một hoặc nhiều hồ sơ.\n"
+        "/update <code>&lt;username&gt;</code> - Cập nhật rating.\n"
+        "/delete <code>&lt;username&gt;</code> - Xóa một hồ sơ.\n"
+        "/search <code>&lt;tên&gt;</code> - Tìm kiếm hồ sơ.\n"
+        "/stats - Xem thống kê dữ liệu.\n"
+        "/random <code>[rating]</code> - Lấy hồ sơ ngẫu nhiên (có thể lọc theo rating).\n"
+        "/backup - Sao lưu dữ liệu ra file CSV.\n"
+        "/cancel - Hủy bỏ thao tác hiện tại."
     )
+    await update.message.reply_text(help_text, parse_mode=ParseMode.HTML)
 
-async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Bắt đầu quá trình thêm URL, kiểm tra trùng lặp và hỏi xếp hạng."""
-    # TỐI ƯU: Kiểm tra xem kết nối Google Sheet có sẵn sàng không.
+@restricted
+async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Hủy bỏ cuộc hội thoại hiện tại."""
+    if context.user_data:
+        context.user_data.clear()
+        await update.message.reply_text("Đã hủy thao tác.")
+    return ConversationHandler.END
+
+# --- Các lệnh không cần hội thoại ---
+
+@restricted
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Hiển thị thống kê dữ liệu."""
     if worksheet is None:
-        await update.message.reply_text("Lỗi nghiêm trọng: Bot không thể kết nối tới Google Sheet. Vui lòng kiểm tra lại cấu hình và khởi động lại bot.")
+        await update.message.reply_text("Lỗi: Bot không thể kết nối tới Google Sheet.")
+        return
+    
+    all_records = worksheet.get_all_records()
+    total_profiles = len(all_records)
+    
+    ratings = [float(r.get(RATING_COLUMN_NAME, 0)) for r in all_records if str(r.get(RATING_COLUMN_NAME, '')).replace('.', '', 1).isdigit()]
+    avg_rating = sum(ratings) / len(ratings) if ratings else 0
+    
+    rating_counts = {i: 0 for i in range(1, 6)}
+    for r in ratings:
+        # Đảm bảo rating là số nguyên hợp lệ trong khoảng 1-5
+        rating_int = int(round(r))
+        if 1 <= rating_int <= 5:
+            rating_counts[rating_int] += 1
+        
+    stats_text = (
+        f"<b>📊 Thống kê dữ liệu</b>\n\n"
+        f"<b>Tổng số hồ sơ:</b> {total_profiles}\n"
+        f"<b>Rating trung bình:</b> {avg_rating:.2f} ⭐️\n\n"
+        f"<b>Phân loại theo rating:</b>\n"
+    )
+    for star, count in rating_counts.items():
+        stats_text += f"  - {star} sao: {count} hồ sơ\n"
+        
+    await update.message.reply_text(stats_text, parse_mode=ParseMode.HTML)
+
+@restricted
+async def random_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Lấy một hồ sơ ngẫu nhiên."""
+    if worksheet is None:
+        await update.message.reply_text("Lỗi: Bot không thể kết nối tới Google Sheet.")
+        return
+
+    all_records = worksheet.get_all_records()
+    target_rating = context.args[0] if context.args else None
+    
+    filtered_records = all_records
+    if target_rating and target_rating.isdigit():
+        filtered_records = [r for r in all_records if str(r.get(RATING_COLUMN_NAME)) == target_rating]
+        if not filtered_records:
+            await update.message.reply_text(f"Không có hồ sơ nào có rating là {target_rating} sao.")
+            return
+
+    if not filtered_records:
+        await update.message.reply_text("Không có hồ sơ nào trong sheet.")
+        return
+        
+    random_profile = random.choice(filtered_records)
+    username = extract_username(random_profile.get("URL", ""))
+    
+    profile_text = (
+        f"<b>✨ Hồ sơ ngẫu nhiên ✨</b>\n\n"
+        f"<b>Username:</b> <code>{username or 'N/A'}</code>\n"
+        f"<b>Rating:</b> {random_profile.get(RATING_COLUMN_NAME, 'N/A')} ⭐️\n"
+        f"<b>Ghi chú:</b> {random_profile.get(NOTES_COLUMN_NAME, 'Không có')}"
+    )
+    await update.message.reply_text(profile_text, parse_mode=ParseMode.HTML)
+
+@restricted
+async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Sao lưu dữ liệu ra file CSV."""
+    if worksheet is None:
+        await update.message.reply_text("Lỗi: Bot không thể kết nối tới Google Sheet.")
+        return
+        
+    await update.message.reply_text("Đang chuẩn bị file sao lưu...")
+    
+    all_data = worksheet.get_all_values()
+    
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerows(all_data)
+    
+    output.seek(0)
+    backup_file = io.BytesIO(output.getvalue().encode('utf-8'))
+    backup_file.name = f"backup_{GOOGLE_SHEET_NAME.replace(' ', '_')}.csv"
+    
+    await update.message.reply_document(document=backup_file)
+
+# --- Các luồng hội thoại ---
+
+# Luồng /add
+@restricted
+async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if worksheet is None:
+        await update.message.reply_text("Lỗi: Bot không thể kết nối tới Google Sheet.")
         return ConversationHandler.END
 
     if not context.args:
-        await update.message.reply_text("Vui lòng cung cấp URL. Ví dụ: /add https://www.instagram.com/google")
+        await update.message.reply_text("Sử dụng: /add <code>&lt;url1&gt; [url2]...</code>", parse_mode=ParseMode.HTML)
         return ConversationHandler.END
 
-    profile_url = context.args[0]
-    new_username = extract_username(profile_url)
-
-    if not new_username:
-        await update.message.reply_text("URL Instagram không hợp lệ. Vui lòng kiểm tra lại.")
-        return ConversationHandler.END
+    urls_to_add = context.args
+    added_count = 0
+    skipped_count = 0
     
     try:
-        # TỐI ƯU: Sử dụng lại kết nối `worksheet` đã được khởi tạo toàn cục.
         existing_urls = worksheet.col_values(2)[1:]
+        existing_usernames = {extract_username(url).lower() for url in existing_urls if extract_username(url)}
+
+        for raw_url in urls_to_add:
+            new_username = extract_username(raw_url)
+            if not new_username:
+                await update.message.reply_text(f"URL không hợp lệ: <code>{raw_url}</code>", parse_mode=ParseMode.HTML)
+                continue
+
+            if new_username.lower() in existing_usernames:
+                skipped_count += 1
+                continue
+            
+            canonical_url = f"https://www.instagram.com/{new_username}/"
+            worksheet.append_row(["", canonical_url])
+            added_count += 1
+            existing_usernames.add(new_username.lower())
+
+        if len(urls_to_add) > 1:
+            await update.message.reply_text(f"Hoàn tất! Đã thêm {added_count} hồ sơ mới, bỏ qua {skipped_count} hồ sơ bị trùng.")
+            return ConversationHandler.END
         
-        for existing_url in existing_urls:
-            existing_username = extract_username(existing_url)
-            if existing_username and existing_username.lower() == new_username.lower():
-                await update.message.reply_text(
-                    f"⚠️ Profile với username <code>{new_username}</code> đã tồn tại trong sheet.",
-                    parse_mode=ParseMode.HTML
-                )
-                return ConversationHandler.END
-
-        worksheet.append_row(["", profile_url])
-        new_row_index = len(worksheet.get_all_values())
-        context.user_data['row_to_update'] = new_row_index
-        logger.info(f"Đã thêm URL '{profile_url}' vào hàng {new_row_index}.")
-
-        keyboard = [[InlineKeyboardButton(f"⭐️ {i}", callback_data=str(i)) for i in range(1, 6)]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-
-        await update.message.reply_text("✅ Đã thêm URL vào sheet. Vui lòng chọn xếp hạng (rating):", reply_markup=reply_markup)
-        
-        return ASKING_RATING
+        if added_count == 1:
+            new_row_index = len(worksheet.get_all_values())
+            context.user_data['row_to_update'] = new_row_index
+            
+            keyboard = [[InlineKeyboardButton(f"⭐️ {i}", callback_data=str(i)) for i in range(1, 6)]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await update.message.reply_text("✅ Đã thêm hồ sơ. Vui lòng chọn xếp hạng:", reply_markup=reply_markup)
+            return ASKING_RATING
+        else:
+            await update.message.reply_text(f"Hồ sơ <code>{extract_username(urls_to_add[0])}</code> đã tồn tại.", parse_mode=ParseMode.HTML)
+            return ConversationHandler.END
 
     except Exception as e:
-        logger.error(f"Lỗi khi thực hiện lệnh /add: {e}")
-        await update.message.reply_text("Đã có lỗi xảy ra trong quá trình xử lý. Vui lòng thử lại sau.")
+        logger.error(f"Lỗi khi thực hiện /add: {e}")
+        await update.message.reply_text("Đã có lỗi xảy ra trong quá trình xử lý.")
         return ConversationHandler.END
 
 async def rating_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Xử lý khi người dùng nhấn nút xếp hạng."""
-    # TỐI ƯU: Kiểm tra xem kết nối Google Sheet có sẵn sàng không.
-    if worksheet is None:
-        await update.message.reply_text("Lỗi nghiêm trọng: Bot không thể kết nối tới Google Sheet. Vui lòng kiểm tra lại cấu hình và khởi động lại bot.")
-        return ConversationHandler.END
-        
     query = update.callback_query
     await query.answer()
-
     rating_value = query.data
     row_index = context.user_data.get('row_to_update')
-
-    if not row_index:
-        await query.edit_message_text(text="Có lỗi xảy ra, không tìm thấy hàng cần cập nhật. Vui lòng thử lại với lệnh /add.")
+    try:
+        headers = worksheet.row_values(1)
+        rating_col_index = headers.index(RATING_COLUMN_NAME) + 1
+        worksheet.update_cell(row_index, rating_col_index, rating_value)
+        await query.edit_message_text(text=f"👍 Đã lưu xếp hạng: {rating_value} sao!")
+        keyboard = [[InlineKeyboardButton("Thêm ghi chú", callback_data="add_note"), InlineKeyboardButton("Bỏ qua", callback_data="skip_note")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.effective_message.reply_text("Bạn có muốn thêm ghi chú cho hồ sơ này không?", reply_markup=reply_markup)
+        return ASKING_NOTE_CHOICE
+    except Exception as e:
+        logger.error(f"Lỗi khi lưu rating: {e}")
+        await update.effective_message.reply_text("Lỗi khi lưu rating.")
         return ConversationHandler.END
 
+async def note_choice_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    if query.data == "add_note":
+        await query.edit_message_text("OK, vui lòng gửi ghi chú của bạn.")
+        return RECEIVING_NOTE
+    else:
+        await query.edit_message_text("Hoàn tất!")
+        context.user_data.clear()
+        return ConversationHandler.END
+
+async def receive_note_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    note_text = update.message.text
+    row_index = context.user_data.get('row_to_update')
     try:
-        # TỐI ƯU: Sử dụng lại kết nối `worksheet` đã được khởi tạo toàn cục.
         headers = worksheet.row_values(1)
+        note_col_index = headers.index(NOTES_COLUMN_NAME) + 1
+        worksheet.update_cell(row_index, note_col_index, note_text)
+        await update.message.reply_text("✅ Đã lưu ghi chú thành công!")
+    except Exception as e:
+        logger.error(f"Lỗi khi lưu note: {e}")
+        await update.message.reply_text("Lỗi khi lưu ghi chú.")
+    context.user_data.clear()
+    return ConversationHandler.END
+
+# Luồng /delete
+@restricted
+async def delete_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not context.args:
+        await update.message.reply_text("Sử dụng: /delete <code>&lt;username&gt;</code>", parse_mode=ParseMode.HTML)
+        return ConversationHandler.END
+    username = context.args[0]
+    row_index, record = find_row_by_username(username)
+    if not row_index:
+        await update.message.reply_text(f"Không tìm thấy hồ sơ với username <code>{username}</code>.", parse_mode=ParseMode.HTML)
+        return ConversationHandler.END
+    context.user_data['row_to_delete'] = row_index
+    keyboard = [[InlineKeyboardButton("🔴 Có, xóa đi", callback_data="confirm_delete"), InlineKeyboardButton("Không", callback_data="cancel_delete")]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text(f"Bạn có chắc chắn muốn xóa hồ sơ của <code>{username}</code> không?", reply_markup=reply_markup, parse_mode=ParseMode.HTML)
+    return ASK_CONFIRM_DELETE
+
+async def delete_confirmation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    if query.data == "confirm_delete":
+        row_index = context.user_data.get('row_to_delete')
         try:
-            rating_col_index = headers.index(RATING_COLUMN_NAME) + 1
-        except ValueError:
-             await query.edit_message_text(text=f"Lỗi: Không tìm thấy cột '{RATING_COLUMN_NAME}' trong Google Sheet của bạn.")
-             return ConversationHandler.END
+            worksheet.delete_rows(row_index)
+            await query.edit_message_text("🗑️ Đã xóa hồ sơ thành công.")
+        except Exception as e:
+            logger.error(f"Lỗi khi xóa hàng: {e}")
+            await query.edit_message_text("Lỗi khi xóa hồ sơ.")
+    else:
+        await query.edit_message_text("Đã hủy thao tác xóa.")
+    context.user_data.clear()
+    return ConversationHandler.END
 
+# Luồng /update
+@restricted
+async def update_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not context.args:
+        await update.message.reply_text("Sử dụng: /update <code>&lt;username&gt;</code>", parse_mode=ParseMode.HTML)
+        return ConversationHandler.END
+    username = context.args[0]
+    row_index, record = find_row_by_username(username)
+    if not row_index:
+        await update.message.reply_text(f"Không tìm thấy hồ sơ với username <code>{username}</code>.", parse_mode=ParseMode.HTML)
+        return ConversationHandler.END
+    context.user_data['row_to_update'] = row_index
+    current_rating = record.get(RATING_COLUMN_NAME, "chưa có")
+    keyboard = [[InlineKeyboardButton(f"⭐️ {i}", callback_data=f"update_{i}") for i in range(1, 6)]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text(f"Hồ sơ <code>{username}</code> (rating hiện tại: {current_rating}).\nChọn rating mới:", reply_markup=reply_markup, parse_mode=ParseMode.HTML)
+    return ASK_UPDATE_RATING
+
+async def update_rating_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    rating_value = query.data.split('_')[1]
+    row_index = context.user_data.get('row_to_update')
+    try:
+        headers = worksheet.row_values(1)
+        rating_col_index = headers.index(RATING_COLUMN_NAME) + 1
         worksheet.update_cell(row_index, rating_col_index, rating_value)
-        logger.info(f"Đã cập nhật xếp hạng '{rating_value}' cho hàng {row_index}.")
-        await query.edit_message_text(text=f"👍 Đã lưu xếp hạng: {rating_value} sao!")
-
+        await query.edit_message_text(f"✅ Đã cập nhật rating thành {rating_value} sao!")
     except Exception as e:
         logger.error(f"Lỗi khi cập nhật rating: {e}")
-        await query.edit_message_text(text="Có lỗi xảy ra khi cập nhật xếp hạng. Vui lòng thử lại.")
-        
-    if 'row_to_update' in context.user_data:
-        del context.user_data['row_to_update']
-        
+        await query.edit_message_text("Lỗi khi cập nhật rating.")
+    context.user_data.clear()
     return ConversationHandler.END
 
-async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Hủy bỏ cuộc hội thoại hiện tại."""
-    await update.message.reply_text("Đã hủy thao tác.")
-    if 'row_to_update' in context.user_data:
-        del context.user_data['row_to_update']
-    return ConversationHandler.END
+# Luồng /search với phân trang
+@restricted
+async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not context.args:
+        await update.message.reply_text("Sử dụng: /search <code>&lt;tên&gt;</code>", parse_mode=ParseMode.HTML)
+        return ConversationHandler.END
+
+    search_term = " ".join(context.args).lower()
+    all_records = worksheet.get_all_records()
+    results = []
+    for record in all_records:
+        username = extract_username(record.get("URL", ""))
+        full_name = record.get("full_name", "")
+        if (username and search_term in username.lower()) or (full_name and search_term in full_name.lower()):
+            results.append(record)
+    
+    if not results:
+        await update.message.reply_text(f"Không tìm thấy hồ sơ nào khớp với '<code>{search_term}</code>'.", parse_mode=ParseMode.HTML)
+        return ConversationHandler.END
+        
+    context.user_data['search_results'] = results
+    context.user_data['search_page'] = 0
+    
+    await send_search_page(update, context)
+    return PAGING_SEARCH_RESULTS
+
+async def send_search_page(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Hàm phụ để hiển thị một trang kết quả tìm kiếm."""
+    results = context.user_data['search_results']
+    page = context.user_data['search_page']
+    page_size = 5
+    
+    start_index = page * page_size
+    end_index = start_index + page_size
+    page_results = results[start_index:end_index]
+    
+    message_text = "<b>Kết quả tìm kiếm:</b>\n\n"
+    for record in page_results:
+        username = extract_username(record.get("URL", ""))
+        message_text += f"• <code>{username or 'N/A'}</code> - Rating: {record.get(RATING_COLUMN_NAME, 'N/A')}\n"
+    
+    message_text += f"\n<i>Trang {page + 1} / { -(-len(results) // page_size) }</i>"
+    
+    keyboard = []
+    row = []
+    if page > 0:
+        row.append(InlineKeyboardButton("⬅️ Trước", callback_data="search_prev"))
+    if end_index < len(results):
+        row.append(InlineKeyboardButton("Sau ➡️", callback_data="search_next"))
+    if row:
+        keyboard.append(row)
+        
+    reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
+    
+    if update.callback_query:
+        await update.callback_query.edit_message_text(message_text, reply_markup=reply_markup, parse_mode=ParseMode.HTML)
+    else:
+        await update.message.reply_text(message_text, reply_markup=reply_markup, parse_mode=ParseMode.HTML)
+
+async def search_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Xử lý nút bấm chuyển trang."""
+    query = update.callback_query
+    await query.answer()
+    
+    action = query.data
+    if action == "search_next":
+        context.user_data['search_page'] += 1
+    elif action == "search_prev":
+        context.user_data['search_page'] -= 1
+        
+    await send_search_page(update, context)
+    return PAGING_SEARCH_RESULTS
+
 
 def main() -> None:
     """Khởi chạy và vận hành bot."""
     application = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    conv_handler = ConversationHandler(
+    # Thêm các hội thoại
+    add_conv = ConversationHandler(
         entry_points=[CommandHandler("add", add_command)],
         states={
-            ASKING_RATING: [CallbackQueryHandler(rating_callback)],
+            ASKING_RATING: [CallbackQueryHandler(rating_callback, pattern=r"^\d$")],
+            ASKING_NOTE_CHOICE: [CallbackQueryHandler(note_choice_callback, pattern=r"^(add_note|skip_note)$")],
+            RECEIVING_NOTE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_note_callback)],
         },
         fallbacks=[CommandHandler("cancel", cancel_command)],
     )
+    delete_conv = ConversationHandler(entry_points=[CommandHandler("delete", delete_command)], states={ASK_CONFIRM_DELETE: [CallbackQueryHandler(delete_confirmation_callback)]}, fallbacks=[CommandHandler("cancel", cancel_command)])
+    update_conv = ConversationHandler(entry_points=[CommandHandler("update", update_command)], states={ASK_UPDATE_RATING: [CallbackQueryHandler(update_rating_callback)]}, fallbacks=[CommandHandler("cancel", cancel_command)])
+    search_conv = ConversationHandler(entry_points=[CommandHandler("search", search_command)], states={PAGING_SEARCH_RESULTS: [CallbackQueryHandler(search_page_callback, pattern=r"^search_")]}, fallbacks=[CommandHandler("cancel", cancel_command)])
 
+    # Thêm các trình xử lý vào ứng dụng
     application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(conv_handler)
+    application.add_handler(CommandHandler("stats", stats_command))
+    application.add_handler(CommandHandler("random", random_command))
+    application.add_handler(CommandHandler("backup", backup_command))
+    application.add_handler(add_conv)
+    application.add_handler(delete_conv)
+    application.add_handler(update_conv)
+    application.add_handler(search_conv)
 
-    print("🚀 Bot đang chạy... Nhấn Ctrl+C để dừng.")
+    print("🚀 Bot siêu cấp đang chạy... Nhấn Ctrl+C để dừng.")
     application.run_polling()
+
 
 if __name__ == "__main__":
     main()
