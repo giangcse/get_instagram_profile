@@ -2,3 +2,5 @@ python-telegram-bot
 gspread 
 google-auth-oauthlib 
 python-dotenv
+httpx
+instaloader

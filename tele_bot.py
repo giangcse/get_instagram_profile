@@ -4,6 +4,7 @@ import os
 import random
 import csv
 import io
+import asyncio
 from functools import wraps
 from dotenv import load_dotenv
 import gspread
@@ -19,7 +20,11 @@ from telegram.ext import (
     CallbackQueryHandler,
     MessageHandler,
     filters,
+    JobQueue,
 )
+
+# Import module scraper
+import scraper
 
 # Tải các biến môi trường từ file .env
 load_dotenv()
@@ -32,11 +37,16 @@ GOOGLE_CREDENTIALS_FILE = os.getenv("GOOGLE_CREDENTIALS_FILE")
 RATING_COLUMN_NAME = os.getenv("RATING_COLUMN_NAME", "Rating")
 NOTES_COLUMN_NAME = os.getenv("NOTES_COLUMN_NAME", "Notes")
 
-# TÍNH NĂNG MỚI: Whitelist - Lấy danh sách ID người dùng được phép
+# Whitelist - Lấy danh sách ID người dùng được phép
 try:
     ALLOWED_USER_IDS = {int(user_id.strip()) for user_id in os.getenv("ALLOWED_USER_IDS", "").split(',') if user_id.strip()}
 except (ValueError, TypeError):
     ALLOWED_USER_IDS = set()
+
+# Cấu hình cho scraper
+INSTAGRAM_SESSION_FILE = os.getenv("INSTAGRAM_SESSION_FILE") # Sửa lỗi: Đổi tên biến để rõ ràng hơn
+FULL_NAME_COLUMN_NAME = os.getenv("FULL_NAME_COLUMN_NAME", "full_name")
+PROFILE_PIC_URL_COLUMN_NAME = os.getenv("PROFILE_PIC_URL_COLUMN_NAME", "profile_pic_url")
 
 # Bật logging
 logging.basicConfig(
@@ -45,7 +55,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Kiểm tra các biến môi trường
-if not all([TELEGRAM_TOKEN, GOOGLE_SHEET_NAME, WORKSHEET_NAME, GOOGLE_CREDENTIALS_FILE]):
+if not all([TELEGRAM_TOKEN, GOOGLE_SHEET_NAME, WORKSHEET_NAME, GOOGLE_CREDENTIALS_FILE, INSTAGRAM_SESSION_FILE]):
     logger.critical("Lỗi: Một hoặc nhiều biến môi trường chưa được thiết lập trong file .env.")
     exit()
 if not ALLOWED_USER_IDS:
@@ -79,7 +89,6 @@ def restricted(func):
         if ALLOWED_USER_IDS and user_id not in ALLOWED_USER_IDS:
             logger.warning(f"Truy cập bị từ chối cho user_id: {user_id}")
             await update.message.reply_text("⛔️ Bạn không có quyền sử dụng bot này.")
-            # Nếu là ConversationHandler, cần trả về trạng thái kết thúc để không làm kẹt hội thoại
             if isinstance(context.application.handlers.get(0), ConversationHandler):
                  return ConversationHandler.END
             return
@@ -104,6 +113,56 @@ def extract_username(url: str) -> str | None:
     match = re.search(r"(?:https?://)?(?:www\.)?instagram\.com/([A-Za-z0-9_](?:(?:[A-Za-z0-9_]|\.(?!\.))*[A-Za-z0-9_]){0,29})", url)
     return match.group(1) if match else None
 
+# ======================= TÁC VỤ NỀN CHO SCRAPING =======================
+
+async def scraping_background_task(context: ContextTypes.DEFAULT_TYPE):
+    """Tác vụ chạy ngầm để cào dữ liệu mà không làm block bot."""
+    job = context.job
+    chat_id = job.chat_id
+    
+    try:
+        all_records = worksheet.get_all_records()
+        headers = worksheet.row_values(1)
+        
+        full_name_col = headers.index(FULL_NAME_COLUMN_NAME) + 1
+        pic_url_col = headers.index(PROFILE_PIC_URL_COLUMN_NAME) + 1
+        
+        profiles_to_scrape = []
+        for index, record in enumerate(all_records):
+            if not record.get(FULL_NAME_COLUMN_NAME) and record.get("URL"):
+                profiles_to_scrape.append({
+                    "row_index": index + 2,
+                    "url": record.get("URL")
+                })
+        
+        if not profiles_to_scrape:
+            await context.bot.send_message(chat_id, text="✅ Không có hồ sơ mới nào cần cào dữ liệu.")
+            return
+
+        # SỬA LỖI: Chạy hàm scraper đồng bộ trong một thread riêng để không block bot
+        scraped_data = await asyncio.to_thread(
+            scraper.scrape_instagram_profiles, INSTAGRAM_SESSION_FILE, profiles_to_scrape
+        )
+        
+        if scraped_data is None:
+             await context.bot.send_message(chat_id, text="❌ Lỗi: Không thể cào dữ liệu. Vui lòng kiểm tra file session và log.")
+             return
+
+        cells_to_update = []
+        for data in scraped_data:
+            row = data['row_index']
+            cells_to_update.append(gspread.Cell(row, full_name_col, data['full_name']))
+            cells_to_update.append(gspread.Cell(row, pic_url_col, data['profile_pic_url']))
+            
+        if cells_to_update:
+            worksheet.update_cells(cells_to_update)
+            
+        await context.bot.send_message(chat_id, text=f"✅ Hoàn tất! Đã cào và cập nhật dữ liệu cho {len(scraped_data)} hồ sơ.")
+
+    except Exception as e:
+        logger.error(f"Lỗi trong tác vụ nền scraping: {e}")
+        await context.bot.send_message(chat_id, text="❌ Đã có lỗi xảy ra trong quá trình cào dữ liệu.")
+
 # ======================= CÁC HÀM XỬ LÝ LỆNH CHÍNH =======================
 
 @restricted
@@ -117,8 +176,9 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "/delete <code>&lt;username&gt;</code> - Xóa một hồ sơ.\n"
         "/search <code>&lt;tên&gt;</code> - Tìm kiếm hồ sơ.\n"
         "/stats - Xem thống kê dữ liệu.\n"
-        "/random <code>[rating]</code> - Lấy hồ sơ ngẫu nhiên (có thể lọc theo rating).\n"
+        "/random <code>[rating]</code> - Lấy hồ sơ ngẫu nhiên.\n"
         "/backup - Sao lưu dữ liệu ra file CSV.\n"
+        "/scrape - Lấy thông tin (tên, ảnh) cho các hồ sơ mới.\n"
         "/cancel - Hủy bỏ thao tác hiện tại."
     )
     await update.message.reply_text(help_text, parse_mode=ParseMode.HTML)
@@ -148,7 +208,6 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     
     rating_counts = {i: 0 for i in range(1, 6)}
     for r in ratings:
-        # Đảm bảo rating là số nguyên hợp lệ trong khoảng 1-5
         rating_int = int(round(r))
         if 1 <= rating_int <= 5:
             rating_counts[rating_int] += 1
@@ -217,6 +276,21 @@ async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     
     await update.message.reply_document(document=backup_file)
 
+@restricted
+async def scrape_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Kích hoạt tác vụ cào dữ liệu chạy ngầm."""
+    if worksheet is None:
+        await update.message.reply_text("Lỗi: Bot không thể kết nối tới Google Sheet.")
+        return
+        
+    chat_id = update.effective_chat.id
+    if context.job_queue:
+        await update.message.reply_text("⏳ Đã bắt đầu quá trình cào dữ liệu. Tác vụ sẽ chạy ngầm, tôi sẽ thông báo khi hoàn thành.")
+        context.job_queue.run_once(scraping_background_task, 0, chat_id=chat_id, name=f"scrape_{chat_id}")
+    else:
+        await update.message.reply_text("Lỗi: JobQueue không khả dụng.")
+
+
 # --- Các luồng hội thoại ---
 
 # Luồng /add
@@ -225,42 +299,33 @@ async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     if worksheet is None:
         await update.message.reply_text("Lỗi: Bot không thể kết nối tới Google Sheet.")
         return ConversationHandler.END
-
     if not context.args:
         await update.message.reply_text("Sử dụng: /add <code>&lt;url1&gt; [url2]...</code>", parse_mode=ParseMode.HTML)
         return ConversationHandler.END
-
     urls_to_add = context.args
     added_count = 0
     skipped_count = 0
-    
     try:
         existing_urls = worksheet.col_values(2)[1:]
         existing_usernames = {extract_username(url).lower() for url in existing_urls if extract_username(url)}
-
         for raw_url in urls_to_add:
             new_username = extract_username(raw_url)
             if not new_username:
                 await update.message.reply_text(f"URL không hợp lệ: <code>{raw_url}</code>", parse_mode=ParseMode.HTML)
                 continue
-
             if new_username.lower() in existing_usernames:
                 skipped_count += 1
                 continue
-            
             canonical_url = f"https://www.instagram.com/{new_username}/"
             worksheet.append_row(["", canonical_url])
             added_count += 1
             existing_usernames.add(new_username.lower())
-
         if len(urls_to_add) > 1:
-            await update.message.reply_text(f"Hoàn tất! Đã thêm {added_count} hồ sơ mới, bỏ qua {skipped_count} hồ sơ bị trùng.")
+            await update.message.reply_text(f"Hoàn tất! Đã thêm {added_count} hồ sơ mới, bỏ qua {skipped_count} hồ sơ bị trùng.\nDùng /scrape để cập nhật thông tin.")
             return ConversationHandler.END
-        
         if added_count == 1:
             new_row_index = len(worksheet.get_all_values())
             context.user_data['row_to_update'] = new_row_index
-            
             keyboard = [[InlineKeyboardButton(f"⭐️ {i}", callback_data=str(i)) for i in range(1, 6)]]
             reply_markup = InlineKeyboardMarkup(keyboard)
             await update.message.reply_text("✅ Đã thêm hồ sơ. Vui lòng chọn xếp hạng:", reply_markup=reply_markup)
@@ -268,7 +333,6 @@ async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         else:
             await update.message.reply_text(f"Hồ sơ <code>{extract_username(urls_to_add[0])}</code> đã tồn tại.", parse_mode=ParseMode.HTML)
             return ConversationHandler.END
-
     except Exception as e:
         logger.error(f"Lỗi khi thực hiện /add: {e}")
         await update.message.reply_text("Đã có lỗi xảy ra trong quá trình xử lý.")
@@ -461,7 +525,11 @@ async def search_page_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
 def main() -> None:
     """Khởi chạy và vận hành bot."""
-    application = Application.builder().token(TELEGRAM_TOKEN).build()
+    # SỬA LỖI: Khởi tạo JobQueue một cách tường minh để đảm bảo nó luôn tồn tại.
+    job_queue = JobQueue()
+    
+    # SỬA LỖI: Xây dựng ứng dụng và truyền job_queue vào.
+    application = Application.builder().token(TELEGRAM_TOKEN).job_queue(job_queue).build()
 
     # Thêm các hội thoại
     add_conv = ConversationHandler(
@@ -474,11 +542,12 @@ def main() -> None:
         fallbacks=[CommandHandler("cancel", cancel_command)],
     )
     delete_conv = ConversationHandler(entry_points=[CommandHandler("delete", delete_command)], states={ASK_CONFIRM_DELETE: [CallbackQueryHandler(delete_confirmation_callback)]}, fallbacks=[CommandHandler("cancel", cancel_command)])
-    update_conv = ConversationHandler(entry_points=[CommandHandler("update", update_command)], states={ASK_UPDATE_RATING: [CallbackQueryHandler(update_rating_callback)]}, fallbacks=[CommandHandler("cancel", cancel_command)])
+    update_conv = ConversationHandler(entry_points=[CommandHandler("update", update_command)], states={ASK_UPDATE_RATING: [CallbackQueryHandler(update_rating_callback, pattern=r"^update_")]}, fallbacks=[CommandHandler("cancel", cancel_command)])
     search_conv = ConversationHandler(entry_points=[CommandHandler("search", search_command)], states={PAGING_SEARCH_RESULTS: [CallbackQueryHandler(search_page_callback, pattern=r"^search_")]}, fallbacks=[CommandHandler("cancel", cancel_command)])
 
     # Thêm các trình xử lý vào ứng dụng
     application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("scrape", scrape_command))
     application.add_handler(CommandHandler("stats", stats_command))
     application.add_handler(CommandHandler("random", random_command))
     application.add_handler(CommandHandler("backup", backup_command))
