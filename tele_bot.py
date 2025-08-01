@@ -12,7 +12,6 @@ from google.oauth2.service_account import Credentials
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
-# SỬA LỖI: Xóa dòng import 'Request' không còn hợp lệ
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -36,7 +35,7 @@ GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME")
 WORKSHEET_NAME = os.getenv("WORKSHEET_NAME")
 GOOGLE_CREDENTIALS_FILE = os.getenv("GOOGLE_CREDENTIALS_FILE")
 RATING_COLUMN_NAME = os.getenv("RATING_COLUMN_NAME", "Rating")
-NOTES_COLUMN_NAME = os.getenv("NOTES_COLUMN_NAME", "Notes")
+# Đã loại bỏ NOTES_COLUMN_NAME
 
 # Whitelist - Lấy danh sách ID người dùng được phép
 try:
@@ -76,10 +75,10 @@ except Exception as e:
     logger.critical(f"LỖI NGHIÊM TRỌNG: Không thể kết nối tới Google Sheets khi khởi động. Lỗi: {e}")
 
 # ======================= ĐỊNH NGHĨA TRẠNG THÁI HỘI THOẠI =======================
-(ASKING_RATING, ASKING_NOTE_CHOICE, RECEIVING_NOTE) = range(3)
-(ASK_CONFIRM_DELETE,) = range(3, 4)
-(ASK_UPDATE_RATING,) = range(4, 5)
-(PAGING_SEARCH_RESULTS,) = range(5, 6)
+(ASKING_RATING,) = range(1)
+(ASK_CONFIRM_DELETE,) = range(1, 2)
+(ASK_UPDATE_RATING,) = range(2, 3)
+(PAGING_SEARCH_RESULTS,) = range(3, 4)
 
 # ======================= HÀM TRANG TRÍ (DECORATORS) & TIỆN ÍCH =======================
 def restricted(func):
@@ -140,7 +139,6 @@ async def scraping_background_task(context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(chat_id, text="✅ Không có hồ sơ mới nào cần cào dữ liệu.")
             return
 
-        # Chạy hàm scraper đồng bộ trong một thread riêng để không block bot
         scraped_data = await asyncio.to_thread(
             scraper.scrape_instagram_profiles, INSTAGRAM_COOKIE_FILE, profiles_to_scrape
         )
@@ -226,7 +224,7 @@ async def random_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
     random_profile = random.choice(filtered_records)
     username = extract_username(random_profile.get("URL", ""))
-    profile_text = (f"<b>✨ Hồ sơ ngẫu nhiên ✨</b>\n\n<b>Username:</b> <code>{username or 'N/A'}</code>\n<b>Rating:</b> {random_profile.get(RATING_COLUMN_NAME, 'N/A')} ⭐️\n<b>Ghi chú:</b> {random_profile.get(NOTES_COLUMN_NAME, 'Không có')}")
+    profile_text = (f"<b>✨ Hồ sơ ngẫu nhiên ✨</b>\n\n<b>Username:</b> <code>{username or 'N/A'}</code>\n<b>Rating:</b> {random_profile.get(RATING_COLUMN_NAME, 'N/A')} ⭐️")
     await update.message.reply_text(profile_text, parse_mode=ParseMode.HTML)
 @restricted
 async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -260,17 +258,13 @@ async def write_profile_to_sheet(profile_data: dict):
     """Hàm tiện ích để ghi một hồ sơ hoàn chỉnh vào Google Sheet."""
     try:
         headers = worksheet.row_values(1)
-        # Tạo một hàng rỗng với đúng số lượng cột
         new_row = [''] * len(headers)
         
-        # Điền dữ liệu vào đúng vị trí cột
         url_col_index = headers.index("URL")
         rating_col_index = headers.index(RATING_COLUMN_NAME)
-        notes_col_index = headers.index(NOTES_COLUMN_NAME)
         
         new_row[url_col_index] = profile_data.get('url', '')
         new_row[rating_col_index] = profile_data.get('rating', '')
-        new_row[notes_col_index] = profile_data.get('note', '')
         
         worksheet.append_row(new_row)
         logger.info(f"Đã ghi hồ sơ {profile_data.get('username')} vào sheet.")
@@ -298,6 +292,7 @@ async def process_next_in_queue(update: Update, context: ContextTypes.DEFAULT_TY
     
     message_text = f"⏳ Đang xử lý: <b>{username}</b>\nVui lòng chọn xếp hạng:"
     
+    # Sửa tin nhắn cũ để tránh spam chat
     if update.callback_query:
         await update.callback_query.edit_message_text(message_text, reply_markup=reply_markup, parse_mode=ParseMode.HTML)
     else:
@@ -316,7 +311,6 @@ async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         return ConversationHandler.END
 
     urls_to_add = context.args
-    # SỬA LỖI: Đổi tên biến từ 'added_profiles_queue' thành 'profiles_to_process_queue'
     profiles_to_process_queue = []
     skipped_count = 0
     
@@ -366,36 +360,7 @@ async def rating_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     current_profile['rating'] = rating_value
     
-    await query.edit_message_text(text=f"👍 Đã lưu xếp hạng: {rating_value} sao cho <b>{current_profile['username']}</b>!", parse_mode=ParseMode.HTML)
-    
-    keyboard = [[InlineKeyboardButton("Thêm ghi chú", callback_data="add_note"), InlineKeyboardButton("Bỏ qua", callback_data="skip_note")]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.effective_message.reply_text("Bạn có muốn thêm ghi chú không?", reply_markup=reply_markup)
-    return ASKING_NOTE_CHOICE
-
-async def note_choice_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-    current_profile = context.user_data.get('current_profile')
-    if query.data == "add_note":
-        await query.edit_message_text("OK, vui lòng gửi ghi chú của bạn.")
-        return RECEIVING_NOTE
-    else:
-        current_profile['note'] = ""
-        await query.edit_message_text("Đã bỏ qua ghi chú. Đang lưu vào sheet...")
-        await write_profile_to_sheet(current_profile)
-        return await process_next_in_queue(update, context)
-
-async def receive_note_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    note_text = update.message.text
-    current_profile = context.user_data.get('current_profile')
-    
-    if not current_profile:
-        await update.message.reply_text("Lỗi: Không tìm thấy thông tin hồ sơ hiện tại. Vui lòng thử lại.")
-        return ConversationHandler.END
-        
-    current_profile['note'] = note_text
-    await update.message.reply_text("✅ Đã lưu ghi chú. Đang lưu vào sheet...")
+    await query.edit_message_text(text=f"👍 Đã lưu xếp hạng: {rating_value} sao cho <b>{current_profile['username']}</b>. Đang lưu vào sheet...", parse_mode=ParseMode.HTML)
     
     await write_profile_to_sheet(current_profile)
     
@@ -536,8 +501,6 @@ def main() -> None:
         entry_points=[CommandHandler("add", add_command)],
         states={
             ASKING_RATING: [CallbackQueryHandler(rating_callback, pattern=r"^\d$")],
-            ASKING_NOTE_CHOICE: [CallbackQueryHandler(note_choice_callback, pattern=r"^(add_note|skip_note)$")],
-            RECEIVING_NOTE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_note_callback)],
         },
         fallbacks=[CommandHandler("cancel", cancel_command)],
     )
