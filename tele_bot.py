@@ -12,7 +12,7 @@ from google.oauth2.service_account import Credentials
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
-from telegram.request import Request # SỬA LỖI: Thêm import cho Request
+# SỬA LỖI: Xóa dòng import 'Request' không còn hợp lệ
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -445,10 +445,15 @@ async def search_page_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
 def main() -> None:
     """Khởi chạy và vận hành bot."""
-    # SỬA LỖI: Tăng thời gian chờ mặc định để chống lỗi TimedOut
-    request = Request(connect_timeout=10, read_timeout=10)
-    job_queue = JobQueue()
-    application = Application.builder().token(TELEGRAM_TOKEN).request(request).job_queue(job_queue).build()
+    # SỬA LỖI: Tăng thời gian chờ mặc định để chống lỗi TimedOut bằng phương pháp mới
+    application = (
+        Application.builder()
+        .token(TELEGRAM_TOKEN)
+        .job_queue(JobQueue())
+        .connect_timeout(15) # Tăng connect timeout lên 15 giây
+        .read_timeout(15)    # Tăng read timeout lên 15 giây
+        .build()
+    )
 
     # Thêm các hội thoại
     add_conv = ConversationHandler(
