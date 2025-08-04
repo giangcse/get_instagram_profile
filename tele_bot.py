@@ -521,52 +521,131 @@ async def search_page_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
 # --- TÍNH NĂNG MỚI: Xử lý Chế độ Inline ---
 async def inline_query_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Xử lý các yêu cầu tìm kiếm inline."""
-    query = update.inline_query.query
-    if not query or len(query) < 2: # Chỉ tìm kiếm khi người dùng gõ ít nhất 2 ký tự
-        return
-
+    """
+    Xử lý các yêu cầu tìm kiếm inline.
+    Hỗ trợ nhiều loại truy vấn: tìm kiếm theo tên, xem thống kê, lấy ngẫu nhiên, lọc theo rating.
+    """
+    query = update.inline_query.query.lower().strip()
+    
     if worksheet is None:
         return
 
     all_records = worksheet.get_all_records()
-    search_term = query.lower()
-    results = []
-    
-    for record in all_records:
-        username = extract_username(record.get("URL", ""))
-        full_name = record.get(FULL_NAME_COLUMN_NAME, "")
-        if (username and search_term in username.lower()) or (full_name and search_term in full_name.lower()):
-            results.append(record)
-    
     inline_results = []
-    for record in results[:10]: # Giới hạn 10 kết quả để tránh spam
-        username = extract_username(record.get("URL", ""))
-        full_name = record.get(FULL_NAME_COLUMN_NAME, username)
-        rating = record.get(RATING_COLUMN_NAME, "N/A")
-        pic_url = record.get(PROFILE_PIC_URL_COLUMN_NAME)
 
-        # Nội dung tin nhắn sẽ được gửi khi người dùng chọn kết quả này
+    # --- Phân tích và xử lý các loại truy vấn khác nhau ---
+
+    # 1. Xử lý lệnh "stats"
+    if query == "stats":
+        total_profiles = len(all_records)
+        ratings = [float(r.get(RATING_COLUMN_NAME, 0)) for r in all_records if str(r.get(RATING_COLUMN_NAME, '')).replace('.', '', 1).isdigit()]
+        avg_rating = sum(ratings) / len(ratings) if ratings else 0
+        
+        # Nội dung tin nhắn sẽ được gửi
         message_content = (
-            f"<b>Tài liệu tham khảo: {full_name}</b>\n\n"
-            f"<b>Username:</b> <code>{username}</code>\n"
-            f"<b>Rating:</b> {rating} ⭐\n"
-            f"<b>URL:</b> {record.get('URL')}"
+            f"<b>📊 Thống kê dữ liệu</b>\n\n"
+            f"<b>Tổng số tài liệu:</b> {total_profiles}\n"
+            f"<b>Rating trung bình:</b> {avg_rating:.2f} ⭐️"
         )
         
         inline_results.append(
             InlineQueryResultArticle(
                 id=str(uuid.uuid4()),
-                title=full_name,
+                title="📊 Thống kê dữ liệu",
+                description=f"Tổng số: {total_profiles} | Rating trung bình: {avg_rating:.2f} ⭐",
+                input_message_content=InputTextMessageContent(
+                    message_content, parse_mode=ParseMode.HTML
+                )
+            )
+        )
+
+    # 2. Xử lý lệnh "random"
+    elif query.startswith("random"):
+        if not all_records:
+            return
+        
+        random_profile = random.choice(all_records)
+        username = extract_username(random_profile.get("URL", ""))
+        full_name = random_profile.get(FULL_NAME_COLUMN_NAME, username)
+        rating = random_profile.get(RATING_COLUMN_NAME, "N/A")
+        
+        message_content = (
+            f"<b>✨ Tài liệu ngẫu nhiên ✨</b>\n\n"
+            f"<b>Tên:</b> {full_name}\n"
+            f"<b>Username:</b> <code>{username}</code>\n"
+            f"<b>Rating:</b> {rating} ⭐\n"
+            f"<b>URL:</b> {random_profile.get('URL')}"
+        )
+        
+        inline_results.append(
+            InlineQueryResultArticle(
+                id=str(uuid.uuid4()),
+                title="🎲 Lấy tài liệu ngẫu nhiên",
                 description=f"@{username} - Rating: {rating} ⭐",
                 input_message_content=InputTextMessageContent(
                     message_content, parse_mode=ParseMode.HTML
                 ),
-                thumbnail_url=pic_url,
+                thumbnail_url=random_profile.get(PROFILE_PIC_URL_COLUMN_NAME),
             )
         )
+
+    # 3. Xử lý lệnh lọc theo rating (ví dụ: "5 sao")
+    elif "sao" in query and query.split(" ")[0].isdigit():
+        try:
+            target_rating = query.split(" ")[0]
+            filtered_records = [r for r in all_records if str(r.get(RATING_COLUMN_NAME)) == target_rating]
+            
+            if not filtered_records:
+                inline_results.append(InlineQueryResultArticle(id=str(uuid.uuid4()), title=f"Không có tài liệu nào được xếp hạng {target_rating} sao.", input_message_content=InputTextMessageContent(f"Không tìm thấy tài liệu nào có rating {target_rating} sao.")))
+            
+            for record in filtered_records[:10]: # Giới hạn 10 kết quả
+                username = extract_username(record.get("URL", ""))
+                full_name = record.get(FULL_NAME_COLUMN_NAME, username)
+                
+                message_content = (f"<b>Tài liệu tham khảo: {full_name}</b>\n\n<b>Username:</b> <code>{username}</code>\n<b>Rating:</b> {target_rating} ⭐\n<b>URL:</b> {record.get('URL')}")
+                
+                inline_results.append(
+                    InlineQueryResultArticle(
+                        id=str(uuid.uuid4()),
+                        title=full_name,
+                        description=f"@{username} - Rating: {target_rating} ⭐",
+                        input_message_content=InputTextMessageContent(message_content, parse_mode=ParseMode.HTML),
+                        thumbnail_url=record.get(PROFILE_PIC_URL_COLUMN_NAME),
+                    )
+                )
+        except Exception as e:
+            logger.error(f"Lỗi khi lọc inline theo rating: {e}")
+
+    # 4. Xử lý tìm kiếm mặc định theo tên
+    elif len(query) >= 2:
+        search_term = query.lower()
+        search_results = []
+        for record in all_records:
+            username = extract_username(record.get("URL", ""))
+            full_name = record.get(FULL_NAME_COLUMN_NAME, "")
+            if (username and search_term in username.lower()) or (full_name and search_term in full_name.lower()):
+                search_results.append(record)
         
+        for record in search_results[:10]:
+            username = extract_username(record.get("URL", ""))
+            full_name = record.get(FULL_NAME_COLUMN_NAME, username)
+            rating = record.get(RATING_COLUMN_NAME, "N/A")
+            
+            message_content = (f"<b>Tài liệu tham khảo: {full_name}</b>\n\n<b>Username:</b> <code>{username}</code>\n<b>Rating:</b> {rating} ⭐\n<b>URL:</b> {record.get('URL')}")
+            
+            inline_results.append(
+                InlineQueryResultArticle(
+                    id=str(uuid.uuid4()),
+                    title=full_name,
+                    description=f"@{username} - Rating: {rating} ⭐",
+                    input_message_content=InputTextMessageContent(message_content, parse_mode=ParseMode.HTML),
+                    thumbnail_url=record.get(PROFILE_PIC_URL_COLUMN_NAME),
+                )
+            )
+
+    # Trả về kết quả cho Telegram
     await update.inline_query.answer(inline_results, cache_time=10)
+
 
 
 def main() -> None:
