@@ -274,10 +274,8 @@ async def process_next_in_queue(update: Update, context: ContextTypes.DEFAULT_TY
     
     message_text = f"⏳ Đang xử lý: <b>{username}</b>\n({len(context.user_data['profiles_to_process']) + 1} hồ sơ còn lại)\nVui lòng chọn xếp hạng:"
     
-    if update.callback_query:
-        await update.callback_query.edit_message_text(message_text, reply_markup=reply_markup, parse_mode=ParseMode.HTML)
-    else:
-        await update.effective_message.reply_text(message_text, reply_markup=reply_markup, parse_mode=ParseMode.HTML)
+    # Luôn sửa tin nhắn cũ
+    await update.callback_query.edit_message_text(message_text, reply_markup=reply_markup, parse_mode=ParseMode.HTML)
         
     return ASKING_RATING
 
