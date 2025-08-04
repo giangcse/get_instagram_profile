@@ -163,7 +163,11 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if context.user_data:
         context.user_data.clear()
-        await update.message.reply_text("Đã hủy thao tác.")
+        # Sửa tin nhắn cuối cùng nếu có thể, nếu không thì gửi tin nhắn mới
+        if update.callback_query:
+            await update.callback_query.edit_message_text("Đã hủy thao tác.")
+        else:
+            await update.message.reply_text("Đã hủy thao tác.")
     return ConversationHandler.END
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -255,7 +259,8 @@ async def process_next_in_queue(update: Update, context: ContextTypes.DEFAULT_TY
     profiles_to_process = context.user_data.get('profiles_to_process', [])
     
     if not profiles_to_process:
-        await update.effective_message.reply_text("✅ Hoàn tất! Đã xử lý tất cả hồ sơ mới.")
+        # Sửa tin nhắn cuối cùng để thông báo hoàn tất
+        await update.callback_query.edit_message_text("✅ Hoàn tất! Đã xử lý tất cả hồ sơ mới.")
         context.user_data.clear()
         return ConversationHandler.END
 
@@ -267,12 +272,10 @@ async def process_next_in_queue(update: Update, context: ContextTypes.DEFAULT_TY
     keyboard = [[InlineKeyboardButton(f"⭐️ {i}", callback_data=str(i)) for i in range(1, 6)]]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    message_text = f"⏳ Đang xử lý: <b>{username}</b>\nVui lòng chọn xếp hạng:"
+    message_text = f"⏳ Đang xử lý: <b>{username}</b>\n({len(context.user_data['profiles_to_process']) + 1} hồ sơ còn lại)\nVui lòng chọn xếp hạng:"
     
-    if update.callback_query:
-        await update.callback_query.edit_message_text(message_text, reply_markup=reply_markup, parse_mode=ParseMode.HTML)
-    else:
-        await update.effective_message.reply_text(message_text, reply_markup=reply_markup, parse_mode=ParseMode.HTML)
+    # Luôn sửa tin nhắn cũ
+    await update.callback_query.edit_message_text(message_text, reply_markup=reply_markup, parse_mode=ParseMode.HTML)
         
     return ASKING_RATING
 
@@ -287,7 +290,7 @@ async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
 
     urls_to_add = context.args
     profiles_to_process_queue = []
-    skipped_count = 0
+    skipped_usernames = []
     
     try:
         existing_urls = worksheet.col_values(2)[1:]
@@ -299,24 +302,33 @@ async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
                 await update.message.reply_text(f"URL không hợp lệ: <code>{raw_url}</code>", parse_mode=ParseMode.HTML)
                 continue
             if new_username.lower() in existing_usernames:
-                skipped_count += 1
+                skipped_usernames.append(new_username)
                 continue
             
             canonical_url = f"https://www.instagram.com/{new_username}/"
             profiles_to_process_queue.append({'username': new_username, 'url': canonical_url})
 
         if not profiles_to_process_queue:
-            await update.message.reply_text(f"Không có hồ sơ nào được thêm. Đã bỏ qua {skipped_count} hồ sơ bị trùng.")
+            summary_text = "Không có hồ sơ nào được thêm."
+            if skipped_usernames:
+                summary_text += f"\nCác hồ sơ sau đã tồn tại: <code>{', '.join(skipped_usernames)}</code>"
+            await update.message.reply_text(summary_text, parse_mode=ParseMode.HTML)
             return ConversationHandler.END
 
         context.user_data['profiles_to_process'] = profiles_to_process_queue
         
-        summary_text = f"Đã tìm thấy {len(profiles_to_process_queue)} hồ sơ mới để thêm."
-        if skipped_count > 0:
-            summary_text += f" Bỏ qua {skipped_count} hồ sơ bị trùng."
-        await update.message.reply_text(summary_text)
+        # Bắt đầu vòng lặp bằng cách gửi tin nhắn đầu tiên
+        first_profile = context.user_data['profiles_to_process'].pop(0)
+        context.user_data['current_profile'] = first_profile
+        username = first_profile['username']
         
-        return await process_next_in_queue(update, context)
+        keyboard = [[InlineKeyboardButton(f"⭐️ {i}", callback_data=str(i)) for i in range(1, 6)]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        message_text = f"⏳ Đang xử lý: <b>{username}</b>\n({len(context.user_data['profiles_to_process']) + 1} hồ sơ còn lại)\nVui lòng chọn xếp hạng:"
+        await update.message.reply_text(message_text, reply_markup=reply_markup, parse_mode=ParseMode.HTML)
+        
+        return ASKING_RATING
 
     except Exception as e:
         logger.error(f"Lỗi khi thực hiện /add: {e}")
@@ -335,10 +347,10 @@ async def rating_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     current_profile['rating'] = rating_value
     
-    await query.edit_message_text(text=f"👍 Đã lưu xếp hạng: {rating_value} sao cho <b>{current_profile['username']}</b>. Đang lưu vào sheet...", parse_mode=ParseMode.HTML)
-    
+    # Ghi vào sheet ngay lập tức
     await write_profile_to_sheet(current_profile)
     
+    # Chuyển sang hồ sơ tiếp theo
     return await process_next_in_queue(update, context)
 
 # --- Các luồng hội thoại khác (không đổi) ---

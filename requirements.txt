@@ -6,3 +6,5 @@ httpx
 instaloader
 cloudinary
 requests
+python-telegram-bot[job-queue]
+selenium

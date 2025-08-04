@@ -1,0 +1,30 @@
+# /etc/systemd/system/telegram_bot.service
+
+[Unit]
+# Mô tả về dịch vụ để bạn dễ nhận biết
+Description=Telegram Bot for Instagram Profile Management
+
+# Yêu cầu dịch vụ này chỉ khởi động sau khi mạng đã sẵn sàng
+After=network.target
+
+[Service]
+# Chạy dịch vụ với người dùng 'pi' thay vì 'root' để tăng cường bảo mật
+User=pi
+Group=pi
+
+# Thư mục làm việc của dự án. Systemd sẽ 'cd' vào đây trước khi chạy script.
+# Điều này rất quan trọng để bot có thể tìm thấy file .env và các file khác.
+WorkingDirectory=/home/pi/get_instagram_profile
+
+# Lệnh để khởi động bot.
+# Hãy chắc chắn rằng đường dẫn đến python và tele_bot.py là chính xác.
+ExecStart=/home/pi/get_instagram_profile/.venv/bin/python /home/pi/get_instagram_profile/tele_bot.py
+
+# Tự động khởi động lại dịch vụ nếu nó gặp lỗi
+Restart=on-failure
+# Chờ 10 giây trước khi khởi động lại
+RestartSec=10s
+
+[Install]
+# Dịch vụ này sẽ được kích hoạt trong môi trường đa người dùng thông thường
+WantedBy=multi-user.target
