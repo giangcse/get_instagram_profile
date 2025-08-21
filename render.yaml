@@ -2,6 +2,7 @@ services:
   - type: web
     name: instagram-telegram-bot
     env: python
+    runtime: python-3.11.8
     buildCommand: pip install -r requirements.txt
     startCommand: python tele_bot.py
     plan: free

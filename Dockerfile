@@ -1,5 +1,5 @@
-# Sử dụng Python 3.11 slim image
-FROM python:3.11-slim
+# Sử dụng Python 3.11 slim image (tương thích với python-telegram-bot)
+FROM python:3.11.8-slim
 
 # Cài đặt các dependencies hệ thống cần thiết
 RUN apt-get update && apt-get install -y \
