@@ -261,7 +261,8 @@ async def random_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
     random_profile = random.choice(filtered_records)
     username = extract_username(random_profile.get("URL", ""))
-    profile_text = (f"<b>✨ Tài liệu ngẫu nhiên ✨</b>\n\n<b>Username:</b> <code>{username or 'N/A'}</code>\n<b>Rating:</b> {random_profile.get(RATING_COLUMN_NAME, 'N/A')} ⭐️")
+    profile_url = random_profile.get("URL", "")
+    profile_text = (f"<b>✨ Tài liệu ngẫu nhiên ✨</b>\n\n<b>Username:</b> <code>{username or 'N/A'}</code>\n<b>Rating:</b> {random_profile.get(RATING_COLUMN_NAME, 'N/A')} ⭐️\n<b>URL:</b> {profile_url}")
     await update.message.reply_text(profile_text, parse_mode=ParseMode.HTML)
 
 async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -493,7 +494,8 @@ async def send_search_page(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message_text = "<b>Kết quả tìm kiếm:</b>\n\n"
     for record in page_results:
         username = extract_username(record.get("URL", ""))
-        message_text += f"• <code>{username or 'N/A'}</code> - Rating: {record.get(RATING_COLUMN_NAME, 'N/A')}\n"
+        profile_url = record.get("URL", "")
+        message_text += f"• <code>{username or 'N/A'}</code> - Rating: {record.get(RATING_COLUMN_NAME, 'N/A')}\n  URL: {profile_url}\n\n"
     message_text += f"\n<i>Trang {page + 1} / { -(-len(results) // page_size) }</i>"
     keyboard = []
     row = []

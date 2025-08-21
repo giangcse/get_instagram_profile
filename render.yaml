@@ -1,0 +1,30 @@
+services:
+  - type: web
+    name: instagram-telegram-bot
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python tele_bot.py
+    plan: free
+    envVars:
+      - key: TELEGRAM_TOKEN
+        sync: false
+      - key: GOOGLE_SHEET_NAME
+        sync: false
+      - key: WORKSHEET_NAME
+        sync: false
+      - key: GOOGLE_CREDENTIALS_FILE
+        value: credentials.json
+      - key: RATING_COLUMN_NAME
+        value: Rating
+      - key: INSTAGRAM_COOKIE_FILE
+        value: instagram_cookies.pkl
+      - key: FULL_NAME_COLUMN_NAME
+        value: full_name
+      - key: PROFILE_PIC_URL_COLUMN_NAME
+        value: profile_pic_url
+      - key: CLOUDINARY_CLOUD_NAME
+        sync: false
+      - key: CLOUDINARY_API_KEY
+        sync: false
+      - key: CLOUDINARY_API_SECRET
+        sync: false
