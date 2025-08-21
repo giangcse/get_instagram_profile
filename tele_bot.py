@@ -652,6 +652,15 @@ async def inline_query_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 
 def main() -> None:
     """Khởi chạy và vận hành bot."""
+    # Khởi động keep-alive system nếu đang chạy trên Render
+    if os.getenv('RENDER'):
+        try:
+            from keep_alive import start_keep_alive
+            flask_app = start_keep_alive()
+            logger.info("✅ Keep-alive system started for Render deployment")
+        except ImportError:
+            logger.warning("⚠️ Keep-alive module not found, continuing without it")
+    
     job_queue = JobQueue()
     application = (
         Application.builder()

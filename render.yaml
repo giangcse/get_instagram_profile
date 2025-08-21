@@ -6,6 +6,8 @@ services:
     startCommand: python tele_bot.py
     plan: free
     envVars:
+      - key: RENDER
+        value: "true"
       - key: TELEGRAM_TOKEN
         sync: false
       - key: GOOGLE_SHEET_NAME

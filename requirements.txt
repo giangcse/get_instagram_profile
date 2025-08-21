@@ -10,3 +10,5 @@ webdriver-manager==4.0.1
 matplotlib==3.8.2
 seaborn==0.13.0
 google-auth==2.25.2
+flask==3.0.0
+schedule==1.2.0
